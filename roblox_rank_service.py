@@ -18,7 +18,7 @@ def getenv(name: str, default: str | None = None) -> str | None:
 
 
 SERVICE_SECRET = getenv("ROBLOX_SERVICE_SECRET")
-OPENCLOUD_API_KEY = getenv("ROBLOX_OPENCLOUD_API_KEY")
+ROBLOX_COOKIE = getenv("ROBLOX_COOKIE")
 GROUP_ID = int(getenv("ROBLOX_GROUP_ID", "34438615") or "34438615")
 PORT = int(getenv("PORT", "8080") or "8080")
 
@@ -48,9 +48,49 @@ def _require_secret(request: web.Request) -> None:
 
 
 def _headers() -> dict[str, str]:
-    if not OPENCLOUD_API_KEY:
-        raise web.HTTPInternalServerError(text="ROBLOX_OPENCLOUD_API_KEY is not configured.")
-    return {"x-api-key": OPENCLOUD_API_KEY, "Content-Type": "application/json"}
+    if not ROBLOX_COOKIE:
+        raise web.HTTPInternalServerError(text="ROBLOX_COOKIE is not configured.")
+    return {
+        "Cookie": f".ROBLOSECURITY={ROBLOX_COOKIE}",
+        "Content-Type": "application/json",
+    }
+
+
+async def _request_with_csrf(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    json: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # Roblox returns X-CSRF-TOKEN on 403 for state-changing endpoints.
+    if method.upper() in {"POST", "PATCH", "PUT", "DELETE"}:
+        resp_headers: dict[str, str] = {}
+        try:
+            await _request_json(session, method, url, headers=headers, json=json)
+        except web.HTTPBadGateway as exc:
+            # Extract token from the failed response by replaying a raw request.
+            async with session.request(method, url, headers=headers, json=json, timeout=30) as resp:
+                resp_headers = dict(resp.headers)
+                text = await resp.text()
+                if resp.status != 403 or "x-csrf-token" not in {k.lower(): v for k, v in resp_headers.items()}:
+                    raise web.HTTPBadGateway(text=f"Roblox API {method} {url} failed {resp.status}: {text}") from exc
+
+            csrf = None
+            for key, value in resp_headers.items():
+                if key.lower() == "x-csrf-token":
+                    csrf = value
+                    break
+            if not csrf:
+                raise web.HTTPBadGateway(text="Roblox did not provide X-CSRF-TOKEN for state-changing request.") from exc
+
+            headers = {**headers, "X-CSRF-TOKEN": csrf}
+            return await _request_json(session, method, url, headers=headers, json=json)
+        else:
+            return {}
+
+    return await _request_json(session, method, url, headers=headers, json=json)
 
 
 async def health(_: web.Request) -> web.Response:
@@ -60,17 +100,14 @@ async def health(_: web.Request) -> web.Response:
 async def ranks(request: web.Request) -> web.Response:
     _require_secret(request)
     headers = _headers()
-    url = f"https://apis.roblox.com/cloud/v2/groups/{GROUP_ID}/roles"
+    url = f"https://groups.roblox.com/v1/groups/{GROUP_ID}/roles"
     async with aiohttp.ClientSession() as session:
         data = await _request_json(session, "GET", url, headers=headers)
 
     roles = []
-    for role in data.get("groupRoles", []) or data.get("roles", []) or []:
+    for role in data.get("roles", []) or []:
         role_name = role.get("displayName") or role.get("name")
-        role_path = str(role.get("path") or "")
         role_id = role.get("id")
-        if not role_id and role_path.startswith(f"groups/{GROUP_ID}/roles/"):
-            role_id = role_path.rsplit("/", 1)[-1]
         roles.append({
             "id": int(role_id) if role_id is not None and str(role_id).isdigit() else role_id,
             "roleId": int(role_id) if role_id is not None and str(role_id).isdigit() else role_id,
@@ -91,24 +128,14 @@ async def set_rank(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="robloxId and roleId are required.")
 
     headers = _headers()
-    list_url = f"https://apis.roblox.com/cloud/v2/groups/{group_id}/memberships?maxPageSize=100&filter=user%3Dusers%2F{user_id}"
+    update_url = f"https://groups.roblox.com/v1/groups/{group_id}/users/{user_id}"
     async with aiohttp.ClientSession() as session:
-        memberships = await _request_json(session, "GET", list_url, headers=headers)
-        items = memberships.get("groupMemberships", []) or memberships.get("memberships", []) or []
-        if not items:
-            raise web.HTTPNotFound(text=f"No membership found for user {user_id} in group {group_id}.")
-
-        membership_path = str(items[0].get("path") or "")
-        if not membership_path:
-            raise web.HTTPBadGateway(text="Membership path missing in Open Cloud response.")
-
-        update_url = f"https://apis.roblox.com/cloud/v2/{membership_path}:assignRole"
-        await _request_json(
+        await _request_with_csrf(
             session,
-            "POST",
+            "PATCH",
             update_url,
             headers=headers,
-            json={"role": f"groups/{group_id}/roles/{int(role_id)}"},
+            json={"roleId": int(role_id)},
         )
 
     return web.json_response({"ok": True, "robloxId": user_id, "groupId": group_id, "roleId": int(role_id)})
