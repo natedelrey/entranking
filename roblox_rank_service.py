@@ -17,7 +17,6 @@ def getenv(name: str, default: str | None = None) -> str | None:
     return v.strip()
 
 
-SERVICE_SECRET = getenv("ROBLOX_SERVICE_SECRET")
 ROBLOX_COOKIE = getenv("ROBLOX_COOKIE")
 GROUP_ID = int(getenv("ROBLOX_GROUP_ID", "34438615") or "34438615")
 PORT = int(getenv("PORT", "8080") or "8080")
@@ -40,18 +39,23 @@ async def _request_json(
         return await resp.json()
 
 
-def _require_secret(request: web.Request) -> None:
-    if not SERVICE_SECRET:
-        raise web.HTTPInternalServerError(text="ROBLOX_SERVICE_SECRET is not configured on this service.")
-    if request.headers.get("X-Secret-Key") != SERVICE_SECRET:
-        raise web.HTTPUnauthorized(text="Invalid X-Secret-Key")
+def _cookie_from_request(request: web.Request) -> str:
+    """Read the Roblox account cookie used to perform group ranking actions."""
+    cookie = request.headers.get("X-Roblox-Cookie") or ROBLOX_COOKIE
+    if not cookie:
+        raise web.HTTPInternalServerError(
+            text="Provide a Roblox account cookie in X-Roblox-Cookie or configure ROBLOX_COOKIE."
+        )
+
+    cookie = cookie.strip()
+    if cookie.startswith(".ROBLOSECURITY="):
+        cookie = cookie.split("=", 1)[1]
+    return cookie
 
 
-def _headers() -> dict[str, str]:
-    if not ROBLOX_COOKIE:
-        raise web.HTTPInternalServerError(text="ROBLOX_COOKIE is not configured.")
+def _headers(request: web.Request) -> dict[str, str]:
     return {
-        "Cookie": f".ROBLOSECURITY={ROBLOX_COOKIE}",
+        "Cookie": f".ROBLOSECURITY={_cookie_from_request(request)}",
         "Content-Type": "application/json",
     }
 
@@ -64,32 +68,18 @@ async def _request_with_csrf(
     headers: dict[str, str],
     json: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    # Roblox returns X-CSRF-TOKEN on 403 for state-changing endpoints.
-    if method.upper() in {"POST", "PATCH", "PUT", "DELETE"}:
-        resp_headers: dict[str, str] = {}
-        try:
-            await _request_json(session, method, url, headers=headers, json=json)
-        except web.HTTPBadGateway as exc:
-            # Extract token from the failed response by replaying a raw request.
-            async with session.request(method, url, headers=headers, json=json, timeout=30) as resp:
-                resp_headers = dict(resp.headers)
-                text = await resp.text()
-                if resp.status != 403 or "x-csrf-token" not in {k.lower(): v for k, v in resp_headers.items()}:
-                    raise web.HTTPBadGateway(text=f"Roblox API {method} {url} failed {resp.status}: {text}") from exc
+    async with session.request(method, url, headers=headers, json=json, timeout=30) as resp:
+        text = await resp.text()
+        if resp.status // 100 == 2:
+            if not text:
+                return {}
+            return await resp.json()
 
-            csrf = None
-            for key, value in resp_headers.items():
-                if key.lower() == "x-csrf-token":
-                    csrf = value
-                    break
-            if not csrf:
-                raise web.HTTPBadGateway(text="Roblox did not provide X-CSRF-TOKEN for state-changing request.") from exc
+        csrf = resp.headers.get("X-CSRF-TOKEN")
+        if resp.status != 403 or not csrf:
+            raise web.HTTPBadGateway(text=f"Roblox API {method} {url} failed {resp.status}: {text}")
 
-            headers = {**headers, "X-CSRF-TOKEN": csrf}
-            return await _request_json(session, method, url, headers=headers, json=json)
-        else:
-            return {}
-
+    headers = {**headers, "X-CSRF-TOKEN": csrf}
     return await _request_json(session, method, url, headers=headers, json=json)
 
 
@@ -98,8 +88,7 @@ async def health(_: web.Request) -> web.Response:
 
 
 async def ranks(request: web.Request) -> web.Response:
-    _require_secret(request)
-    headers = _headers()
+    headers = _headers(request)
     url = f"https://groups.roblox.com/v1/groups/{GROUP_ID}/roles"
     async with aiohttp.ClientSession() as session:
         data = await _request_json(session, "GET", url, headers=headers)
@@ -119,7 +108,6 @@ async def ranks(request: web.Request) -> web.Response:
 
 
 async def set_rank(request: web.Request) -> web.Response:
-    _require_secret(request)
     body = await request.json()
     user_id = int(body.get("robloxId") or 0)
     group_id = int(body.get("groupId") or GROUP_ID)
@@ -127,7 +115,7 @@ async def set_rank(request: web.Request) -> web.Response:
     if not user_id or not role_id:
         raise web.HTTPBadRequest(text="robloxId and roleId are required.")
 
-    headers = _headers()
+    headers = _headers(request)
     update_url = f"https://groups.roblox.com/v1/groups/{group_id}/users/{user_id}"
     async with aiohttp.ClientSession() as session:
         await _request_with_csrf(
